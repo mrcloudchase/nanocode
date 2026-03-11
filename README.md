@@ -45,13 +45,13 @@ echo "ANTHROPIC_API_KEY=your_key_here" > .env
 #### Development mode (interpreted)
 
 ```bash
-bun nanodeepagent.ts
+bun nanocode.ts
 ```
 
 #### Compile to standalone binary
 
 ```bash
-bun build nanodeepagent.ts --compile --outfile nanocode
+bun build nanocode.ts --compile --outfile nanocode
 ./nanocode
 ```
 
@@ -91,7 +91,7 @@ Once running, you'll see the logo and a prompt. Type your coding request, and Cl
 
 ### Single-File Design
 
-The entire application is contained in `nanodeepagent.ts`:
+The entire application is contained in `nanocode.ts`:
 
 - Constants (API URL, model, ANSI colors)
 - Tool implementations (six file/system tools)
@@ -118,7 +118,7 @@ Tool errors propagate directly to the model with `is_error: true`, allowing it t
 
 Default: `claude-sonnet-4-5`
 
-Edit the `MODEL` constant in `nanodeepagent.ts` to change.
+Edit the `MODEL` constant in `nanocode.ts` to change.
 
 ### Environment Variables
 
@@ -128,13 +128,13 @@ Edit the `MODEL` constant in `nanodeepagent.ts` to change.
 
 ```bash
 # macOS ARM64 (default on Apple Silicon)
-bun build nanodeepagent.ts --compile --outfile nanocode
+bun build nanocode.ts --compile --outfile nanocode
 
 # x86_64 (Intel)
-bun build nanodeepagent.ts --compile --target=x86_64 --outfile nanocode-x64
+bun build nanocode.ts --compile --target=x86_64 --outfile nanocode-x64
 
 # Linux ARM64
-bun build nanodeepagent.ts --compile --target=linux-arm64 --outfile nanocode-linux-arm64
+bun build nanocode.ts --compile --target=linux-arm64 --outfile nanocode-linux-arm64
 ```
 
 ## Limitations
