@@ -44,10 +44,6 @@ const TOOLS: Record<string, { desc: string; params: string[]; fn: (args: any) =>
     params: ["path", "old", "new"],
     fn: async (args) => {
       const content = await readFile(args.path, "utf-8");
-      if (!content.includes(args.old)) return "error: old_string not found";
-      const escaped = args.old.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const count = (content.match(new RegExp(escaped, "g")) ?? []).length;
-      if (!args.all && count > 1) return `error: old_string appears ${count} times`;
       const result = args.all ? content.split(args.old).join(args.new) : content.replace(args.old, args.new);
       await writeFile(args.path, result, "utf-8");
       return "ok";
@@ -72,12 +68,10 @@ const TOOLS: Record<string, { desc: string; params: string[]; fn: (args: any) =>
       const hits: string[] = [];
       for await (const file of new Bun.Glob(`${args.path ?? "."}/**`).scan()) {
         if (file.includes("node_modules")) continue;
-        try {
-          const content = await readFile(file, "utf-8");
-          content.split("\n").forEach((line, i) => {
-            if (pattern.test(line)) hits.push(`${file}:${i + 1}:${line.trim()}`);
-          });
-        } catch {}
+        const content = await readFile(file, "utf-8");
+        content.split("\n").forEach((line, i) => {
+          if (pattern.test(line)) hits.push(`${file}:${i + 1}:${line.trim()}`);
+        });
       }
       return hits.slice(0, 50).join("\n") || "none";
     },
@@ -85,13 +79,7 @@ const TOOLS: Record<string, { desc: string; params: string[]; fn: (args: any) =>
   bash: {
     desc: "Run shell command",
     params: ["cmd"],
-    fn: (args) => {
-      try {
-        return execSync(args.cmd, { encoding: "utf-8", timeout: 30000 }).trim() || "(empty)";
-      } catch (err: any) {
-        return (err.stdout || err.stderr || String(err)).trim();
-      }
-    },
+    fn: (args) => execSync(args.cmd, { encoding: "utf-8", timeout: 30000 }).trim(),
   },
 };
 
@@ -122,10 +110,60 @@ async function callAPI(messages: any[], systemPrompt: string) {
       system: systemPrompt,
       messages,
       tools: buildToolSchema(),
+      stream: true,
     }),
   });
   if (!response.ok) throw new Error(`API error: ${response.status}`);
-  return response.json();
+
+  const content: any[] = [];
+  let stopReason = "";
+  let buffer = "";
+  let currentBlock: any = null;
+  let toolJsonBuf = "";
+  let textStarted = false;
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop()!;
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = JSON.parse(line.slice(6));
+
+      if (data.type === "content_block_start") {
+        currentBlock = data.content_block;
+        if (currentBlock.type === "text") {
+          textStarted = false;
+        } else if (currentBlock.type === "tool_use") {
+          toolJsonBuf = "";
+        }
+      } else if (data.type === "content_block_delta") {
+        if (data.delta.type === "text_delta") {
+          if (!textStarted) { process.stdout.write(`\n${ANSI.cyan}⏺${ANSI.reset} `); textStarted = true; }
+          process.stdout.write(data.delta.text);
+          currentBlock.text = (currentBlock.text || "") + data.delta.text;
+        } else if (data.delta.type === "input_json_delta") {
+          toolJsonBuf += data.delta.partial_json;
+        }
+      } else if (data.type === "content_block_stop") {
+        if (currentBlock.type === "tool_use") {
+          currentBlock.input = toolJsonBuf ? JSON.parse(toolJsonBuf) : {};
+        }
+        content.push(currentBlock);
+        currentBlock = null;
+      } else if (data.type === "message_delta") {
+        stopReason = data.delta.stop_reason ?? stopReason;
+      }
+    }
+  }
+
+  return { content, stop_reason: stopReason };
 }
 
 // --- Main ---
@@ -171,23 +209,23 @@ ${ANSI.dim}Deep Agent${ANSI.reset} | ${ANSI.dim}${MODEL}${ANSI.reset} | ${ANSI.d
     // Agentic loop
     while (true) {
       const response = await callAPI(messages, systemPrompt);
-      const toolResults: any[] = [];
-      for (const block of response.content) {
-        if (block.type === "text") {
-          console.log(`\n${ANSI.cyan}⏺${ANSI.reset} ${block.text}`);
-        } else if (block.type === "tool_use") {
+      messages.push({ role: "assistant", content: response.content });
+      if (response.stop_reason !== "tool_use") break;
+
+      const toolResults = await Promise.all(
+        response.content.filter((b: any) => b.type === "tool_use").map(async (block: any) => {
           const preview = String(Object.values(block.input)[0] ?? "").slice(0, 50);
           console.log(`\n${ANSI.green}⏺ ${block.name}${ANSI.reset}(${ANSI.dim}${preview}${ANSI.reset})`);
-          const tool = TOOLS[block.name];
-          const result = tool ? await tool.fn(block.input) : `error: unknown tool ${block.name}`;
-          const lines = result.split("\n");
-          const resultPreview = lines[0].slice(0, 60) + (lines.length > 1 ? ` +${lines.length - 1} lines` : "");
-          console.log(`  ${ANSI.dim}⎿  ${resultPreview}${ANSI.reset}`);
-          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
-        }
-      }
-      messages.push({ role: "assistant", content: response.content });
-      if (toolResults.length === 0) break;
+          try {
+            const result = await (TOOLS[block.name]?.fn(block.input) ?? `unknown tool: ${block.name}`);
+            const lines = result.split("\n");
+            console.log(`  ${ANSI.dim}⎿  ${lines[0].slice(0, 60)}${lines.length > 1 ? ` +${lines.length - 1} lines` : ""}${ANSI.reset}`);
+            return { type: "tool_result", tool_use_id: block.id, content: result };
+          } catch (err: any) {
+            return { type: "tool_result", tool_use_id: block.id, content: String(err), is_error: true };
+          }
+        }),
+      );
       messages.push({ role: "user", content: toolResults });
     }
     console.log();
