@@ -1,7 +1,5 @@
 #!/usr/bin/env bun
-/**
- * nanodeepagent - minimal deep agent in TypeScript
- */
+/** nanocode - minimal deep coding agent */
 import { readFile, writeFile } from "node:fs/promises";
 import { execSync } from "node:child_process";
 import * as readline from "node:readline";
@@ -52,13 +50,7 @@ const TOOLS: Record<string, { desc: string; params: string[]; fn: (args: any) =>
   glob: {
     desc: "Find files by pattern",
     params: ["pat"],
-    fn: async (args) => {
-      const files: string[] = [];
-      for await (const file of new Bun.Glob(`${args.path ?? "."}/${args.pat}`).scan()) {
-        files.push(file);
-      }
-      return files.join("\n") || "none";
-    },
+    fn: async (args) => (await Array.fromAsync(new Bun.Glob(`${args.path ?? "."}/${args.pat}`).scan())).join("\n") || "none",
   },
   grep: {
     desc: "Search files for regex",
@@ -177,7 +169,7 @@ ${ANSI.bold}${ANSI.cyan}
  ██║ ╚████║██║  ██║██║ ╚████║╚██████╔╝╚██████╗╚██████╔╝██████╔╝███████╗
  ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
 ${ANSI.reset}
-${ANSI.dim}Deep Agent${ANSI.reset} | ${ANSI.dim}${MODEL}${ANSI.reset} | ${ANSI.dim}${process.cwd()}${ANSI.reset}
+${ANSI.dim}nanocode${ANSI.reset} | ${ANSI.dim}${MODEL}${ANSI.reset} | ${ANSI.dim}${process.cwd()}${ANSI.reset}
 `);
 
   const messages: any[] = [];
@@ -212,8 +204,7 @@ ${ANSI.dim}Deep Agent${ANSI.reset} | ${ANSI.dim}${MODEL}${ANSI.reset} | ${ANSI.d
           console.log(`\n${ANSI.green}⏺ ${block.name}${ANSI.reset}(${ANSI.dim}${preview}${ANSI.reset})`);
           try {
             const result = await (TOOLS[block.name]?.fn(block.input) ?? `unknown tool: ${block.name}`);
-            const lines = result.split("\n");
-            console.log(`  ${ANSI.dim}⎿  ${lines[0].slice(0, 60)}${lines.length > 1 ? ` +${lines.length - 1} lines` : ""}${ANSI.reset}`);
+            console.log(`  ${ANSI.dim}⎿  ${result.split("\n")[0].slice(0, 60)}${result.includes("\n") ? ` +${result.split("\n").length - 1} lines` : ""}${ANSI.reset}`);
             return { type: "tool_result", tool_use_id: block.id, content: result };
           } catch (err: any) {
             return { type: "tool_result", tool_use_id: block.id, content: String(err), is_error: true };
