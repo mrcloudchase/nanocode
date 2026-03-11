@@ -1,21 +1,22 @@
-# nanodeepagent
+# nanocode
 
-![nanodeepagent](./screenshot.png)
+![nanocode](./screenshot.png)
 
 > **Credit**: This project was inspired by [nanocode](https://github.com/1rgs/nanocode) - thanks for the original idea!
 >
 > **Want more?** If you're looking to build a more comprehensive version with a proper deep agent harness, check out [Deep Agent SDK](https://deepagentsdk.dev/docs).
 
-A minimal Claude Code alternative - an interactive terminal-based coding assistant with agentic tool use. Built with TypeScript and Bun, nanodeepagent provides a REPL interface where Claude can read, edit, search files, and execute shell commands autonomously.
+A minimal Claude Code alternative - an interactive terminal-based coding assistant with agentic tool use. Built with TypeScript and Bun, nanocode provides a streaming REPL interface where Claude can read, edit, search files, and execute shell commands autonomously.
 
 ## Features
 
-- 🤖 **Agentic Loop**: Claude continuously executes tools until tasks complete
-- 📁 **File Operations**: Read, write, and edit files with line numbers
-- 🔍 **Code Search**: Grep patterns and glob file matching
-- 💻 **Shell Integration**: Execute bash commands directly
-- 🎨 **Rich Terminal UI**: ASCII art, colored output, and Markdown rendering
-- ⚡ **Bun Runtime**: Fast TypeScript execution and standalone binary compilation
+- **Agentic Loop**: Claude continuously executes tools until tasks complete
+- **Streaming**: Real-time text output via Server-Sent Events
+- **Parallel Tool Execution**: Multiple tool calls run concurrently when the model decides they're independent
+- **File Operations**: Read, write, and edit files with line numbers
+- **Code Search**: Grep patterns and glob file matching
+- **Shell Integration**: Execute bash commands directly
+- **Bun Runtime**: Fast TypeScript execution and standalone binary compilation
 
 ## Quick Start
 
@@ -29,11 +30,11 @@ A minimal Claude Code alternative - an interactive terminal-based coding assista
 1. Clone the repository:
 
 ```bash
-git clone <repository-url>
-cd nanodeepagent
+git clone https://github.com/mrcloudchase/nanocode.git
+cd nanocode
 ```
 
-1. Set up your API key:
+2. Set up your API key:
 
 ```bash
 echo "ANTHROPIC_API_KEY=your_key_here" > .env
@@ -50,13 +51,13 @@ bun nanodeepagent.ts
 #### Compile to standalone binary
 
 ```bash
-bun build nanodeepagent.ts --compile --outfile nanodeepagent
-./nanodeepagent
+bun build nanodeepagent.ts --compile --outfile nanocode
+./nanocode
 ```
 
 ## Usage
 
-Once running, you'll see the nanodeepagent logo and a prompt (`❯`). Simply type your coding request, and Claude will use tools autonomously to complete the task.
+Once running, you'll see the logo and a prompt. Type your coding request, and Claude will use tools autonomously to complete the task.
 
 ### REPL Commands
 
@@ -67,17 +68,15 @@ Once running, you'll see the nanodeepagent logo and a prompt (`❯`). Simply typ
 ### Example Session
 
 ```
-❯ Create a hello world function in hello.ts
+> Create a hello world function in hello.ts
 
-⏺ Write(hello.ts)
-  ⎿  ok
+> Write(hello.ts)
+  ok
 
-⏺ I've created a hello.ts file with a simple hello world function...
+> I've created a hello.ts file with a simple hello world function...
 ```
 
 ## Tool Capabilities
-
-nanodeepagent provides Claude with six powerful tools:
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
@@ -88,32 +87,30 @@ nanodeepagent provides Claude with six powerful tools:
 | `grep` | Search files with regex | `pat`, `path?` |
 | `bash` | Execute shell commands | `cmd` |
 
-All tools execute with the current working directory as context.
-
 ## Architecture
 
 ### Single-File Design
 
-The entire application is contained in `nanodeepagent.ts` with clear sections:
+The entire application is contained in `nanodeepagent.ts`:
 
 - Constants (API URL, model, ANSI colors)
-- Type definitions (TypeScript interfaces)
 - Tool implementations (six file/system tools)
-- Tool registry (centralized metadata)
-- Helper functions (API calls, formatting)
-- Main REPL (interactive loop)
+- Streaming API layer (SSE parser, tool input accumulator)
+- Main REPL (interactive agentic loop)
 
 ### Agentic Loop
 
-The core pattern:
-
 1. User provides request
-2. Claude responds with text and/or tool calls
-3. Tools execute and results are returned to Claude
-4. Loop continues until Claude responds without tools
-5. Task complete ✅
+2. Claude responds via streaming (text prints in real-time)
+3. If `stop_reason` is `tool_use`, tools execute in parallel via `Promise.all`
+4. Tool results (success or error) are sent back to Claude
+5. Loop continues until `stop_reason` is `end_turn`
 
-This allows Claude to chain multiple operations autonomously (e.g., read file → analyze → edit file → verify).
+### Tool Execution Model
+
+The model decides which tools to call and whether they're independent. If multiple `tool_use` blocks appear in a single response, they run concurrently. If the model needs sequential execution, it calls tools across separate turns. No client-side ordering logic needed.
+
+Tool errors propagate directly to the model with `is_error: true`, allowing it to adjust its approach on the next turn.
 
 ## Configuration
 
@@ -121,113 +118,36 @@ This allows Claude to chain multiple operations autonomously (e.g., read file �
 
 Default: `claude-sonnet-4-5`
 
-To change the model, edit the `MODEL` constant in `nanodeepagent.ts`:
-
-```typescript
-const MODEL = "claude-sonnet-4-5";
-```
-
-### API Endpoint
-
-The application uses Anthropic's Messages API:
-
-```
-https://api.anthropic.com/v1/messages
-```
+Edit the `MODEL` constant in `nanodeepagent.ts` to change.
 
 ### Environment Variables
 
 - `ANTHROPIC_API_KEY` (required) - Your Anthropic API key
 
-## Development
-
-### Type Checking
-
-```bash
-bun --print "import './nanodeepagent.ts'"
-```
-
-### Building for Different Platforms
+## Building for Different Platforms
 
 ```bash
 # macOS ARM64 (default on Apple Silicon)
-bun build nanodeepagent.ts --compile --outfile nanodeepagent
+bun build nanodeepagent.ts --compile --outfile nanocode
 
 # x86_64 (Intel)
-bun build nanodeepagent.ts --compile --target=x86_64 --outfile nanodeepagent-x64
+bun build nanodeepagent.ts --compile --target=x86_64 --outfile nanocode-x64
 
 # Linux ARM64
-bun build nanodeepagent.ts --compile --target=linux-arm64 --outfile nanodeepagent-linux-arm64
+bun build nanodeepagent.ts --compile --target=linux-arm64 --outfile nanocode-linux-arm64
 ```
-
-### Project Structure
-
-```
-nanodeepagent/
-├── nanodeepagent.ts    # Main application (single file)
-├── package.json        # Dependencies
-├── tsconfig.json       # TypeScript config
-├── .env               # API key (gitignored)
-├── README.md          # This file
-└── CLAUDE.md          # Developer guide for Claude Code
-```
-
-## Technical Details
-
-### Dependencies
-
-- `@types/bun` - Bun TypeScript definitions
-- `typescript` ^5 - TypeScript compiler
-
-### Runtime
-
-Built with Bun, which provides:
-
-- Fast TypeScript execution
-- Built-in bundler and compiler
-- Native APIs (Glob, file I/O)
-- Standalone binary compilation (~60MB, runtime included)
-
-### API Integration
-
-- **Max tokens**: 8192
-- **System prompt**: Includes current working directory
-- **Tool schema**: Auto-generated from tool registry
-- **Message format**: Anthropic Messages API with tool use
-
-## Error Handling
-
-- Tool errors return as strings (prefixed with `"error: "`)
-- API errors display with status and message
-- Shell commands timeout after 30 seconds
-- File operations handle permissions gracefully
 
 ## Limitations
 
 - Single conversation thread (use `/c` to clear)
 - No conversation persistence between sessions
-- Tool results limited (grep: 50 matches, text previews: 60 chars)
-- Shell commands limited to 30-second execution
-- No streaming output (results display after completion)
-
-## Contributing
-
-This is a minimal implementation designed for simplicity and clarity. The entire codebase is ~375 lines in a single file, making it easy to understand, modify, and extend.
-
-To add a new tool:
-
-1. Implement the function
-2. Add entry to `TOOLS` registry
-3. Claude will automatically have access
+- Grep results capped at 50 matches
+- Shell commands timeout after 30 seconds
 
 ## License
 
-[Your license here]
+MIT
 
 ## Acknowledgments
 
 Inspired by Claude Code and built as a demonstration of agentic tool use with the Anthropic API.
-
----
-
-**Model**: claude-sonnet-4-5 | **Runtime**: Bun | **Language**: TypeScript
