@@ -8,28 +8,73 @@ import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
 
 // --- Config ---
-const COMPACT_THRESHOLD = 150000;
-const TOOL_SUMMARIZE_THRESHOLD = 200;
+type ProviderConfig = { apiBase: string; keyEnv: string; format: "anthropic" | "openai"; defaultModel: string; summarizeModel: string };
+
+type NanocodeConfig = {
+  gateway: { port: number; host: string };
+  providers: Record<string, ProviderConfig>;
+  models: { costPerMtok: Record<string, [number, number]> };
+  memory: { compactThreshold: number; toolSummarizeThreshold: number; injectionMaxTokens: number; relevanceThreshold: number; skillTokenBudget: number };
+  sandbox: { network: boolean };
+  adapters: { slack: { rateLimitWindow: number; rateLimitMax: number }; discord: {} };
+  agents: { mapping: Record<string, { workspace?: string; model?: string; agentsFile?: string }> };
+  voice: { model: string; speed: number; voice: string };
+  canvas: { port: number };
+};
+
+const DEFAULT_CONFIG: NanocodeConfig = {
+  gateway: { port: 18789, host: "127.0.0.1" },
+  providers: {
+    anthropic: { apiBase: "https://api.anthropic.com/v1", keyEnv: "ANTHROPIC_API_KEY", format: "anthropic", defaultModel: "claude-sonnet-4-5", summarizeModel: "claude-haiku-4-5-20251001" },
+    openai: { apiBase: "https://api.openai.com/v1", keyEnv: "OPENAI_API_KEY", format: "openai", defaultModel: "gpt-4o", summarizeModel: "gpt-4o-mini" },
+  },
+  models: { costPerMtok: { "claude-sonnet-4-5": [3, 15], "claude-haiku-4-5-20251001": [0.8, 4], "gpt-4o": [2.5, 10], "gpt-4o-mini": [0.15, 0.6] } },
+  memory: { compactThreshold: 150000, toolSummarizeThreshold: 200, injectionMaxTokens: 4000, relevanceThreshold: 0.3, skillTokenBudget: 4000 },
+  sandbox: { network: false },
+  adapters: { slack: { rateLimitWindow: 60000, rateLimitMax: 10 }, discord: {} },
+  agents: { mapping: {} },
+  voice: { model: "tts-1", speed: 1, voice: "alloy" },
+  canvas: { port: 18793 },
+};
+
+let CONFIG: NanocodeConfig = structuredClone(DEFAULT_CONFIG);
+
+function deepMerge(target: any, source: any): any {
+  for (const key of Object.keys(source)) {
+    if (source[key] && typeof source[key] === "object" && !Array.isArray(source[key]) && target[key] && typeof target[key] === "object") {
+      deepMerge(target[key], source[key]);
+    } else { target[key] = source[key]; }
+  }
+  return target;
+}
+
+function loadConfig(): NanocodeConfig {
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  try { const raw = require("fs").readFileSync(`${process.env.HOME}/.nanocode/config.json`, "utf-8"); deepMerge(cfg, JSON.parse(raw)); } catch {}
+  // Env var overrides
+  if (process.env.NANOCODE_GATEWAY_PORT) cfg.gateway.port = Number(process.env.NANOCODE_GATEWAY_PORT);
+  if (process.env.NANOCODE_GATEWAY_HOST) cfg.gateway.host = process.env.NANOCODE_GATEWAY_HOST;
+  if (process.env.NANOCODE_COMPACT_THRESHOLD) cfg.memory.compactThreshold = Number(process.env.NANOCODE_COMPACT_THRESHOLD);
+  if (process.env.NANOCODE_MEMORY_MAX_TOKENS) cfg.memory.injectionMaxTokens = Number(process.env.NANOCODE_MEMORY_MAX_TOKENS);
+  if (process.env.NANOCODE_SANDBOX_NETWORK === "true") cfg.sandbox.network = true;
+  CONFIG = cfg;
+  return cfg;
+}
+
 const NANOCODE_DIR = `${process.env.HOME}/.nanocode`;
 const SESSIONS_DIR = `${NANOCODE_DIR}/sessions`;
 const MEMORY_DIR = `${NANOCODE_DIR}/memory`;
 const EXTENSIONS_DIRS = [`${NANOCODE_DIR}/extensions`, ".nanocode/extensions"];
-const GATEWAY_PORT = Number(process.env.NANOCODE_GATEWAY_PORT ?? 18789);
-const GATEWAY_HOST = "127.0.0.1";
-const MEMORY_INJECTION_MAX_TOKENS = 4000;
-const MEMORY_RELEVANCE_THRESHOLD = 0.3; // min FTS5 rank score
 
-type ProviderConfig = { apiBase: string; keyEnv: string; format: "anthropic" | "openai"; defaultModel: string; summarizeModel: string };
-
-const PROVIDERS: Record<string, ProviderConfig> = {
-  anthropic: { apiBase: "https://api.anthropic.com/v1", keyEnv: "ANTHROPIC_API_KEY", format: "anthropic", defaultModel: "claude-sonnet-4-5", summarizeModel: "claude-haiku-4-5-20251001" },
-  openai: { apiBase: "https://api.openai.com/v1", keyEnv: "OPENAI_API_KEY", format: "openai", defaultModel: "gpt-4o", summarizeModel: "gpt-4o-mini" },
-};
-
-const COST_PER_MTOK: Record<string, [number, number]> = {
-  "claude-sonnet-4-5": [3, 15], "claude-haiku-4-5-20251001": [0.8, 4],
-  "gpt-4o": [2.5, 10], "gpt-4o-mini": [0.15, 0.6],
-};
+// Accessors that read from CONFIG (set after loadConfig)
+const getCompactThreshold = () => CONFIG.memory.compactThreshold;
+const getToolSummarizeThreshold = () => CONFIG.memory.toolSummarizeThreshold;
+const getMemoryInjectionMaxTokens = () => CONFIG.memory.injectionMaxTokens;
+const getMemoryRelevanceThreshold = () => CONFIG.memory.relevanceThreshold;
+const getGatewayPort = () => CONFIG.gateway.port;
+const getGatewayHost = () => CONFIG.gateway.host;
+const getProviders = () => CONFIG.providers;
+const getCostPerMtok = () => CONFIG.models.costPerMtok;
 
 const ANSI = { reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m", blue: "\x1b[34m", cyan: "\x1b[36m", green: "\x1b[32m", red: "\x1b[31m", yellow: "\x1b[33m" };
 
@@ -115,7 +160,7 @@ function wsSink(ws: any, sessionId: string): OutputSink {
 const sessions = new Map<string, SessionState>();
 
 function createSession(id: string, type: SessionType, opts: { provider?: ProviderConfig; model?: string; cwd?: string } = {}): SessionState {
-  const prov = opts.provider ?? PROVIDERS.anthropic;
+  const prov = opts.provider ?? getProviders().anthropic;
   const session: SessionState = {
     id, type,
     messages: [],
@@ -131,8 +176,26 @@ function createSession(id: string, type: SessionType, opts: { provider?: Provide
   return session;
 }
 
+function matchGlob(pattern: string, str: string): boolean {
+  const regex = new RegExp("^" + pattern.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^:]*") + "$");
+  return regex.test(str);
+}
+
 function getOrCreateSession(id: string, type: SessionType): SessionState {
-  return sessions.get(id) ?? createSession(id, type);
+  const existing = sessions.get(id);
+  if (existing) return existing;
+  const session = createSession(id, type);
+  // Apply multi-agent routing from config
+  const mapping = CONFIG.agents.mapping;
+  for (const [pattern, overrides] of Object.entries(mapping)) {
+    if (matchGlob(pattern, id)) {
+      if (overrides.workspace) session.cwd = overrides.workspace;
+      if (overrides.model) session.model = overrides.model;
+      if (overrides.agentsFile) (session as any)._agentsFile = overrides.agentsFile;
+      break;
+    }
+  }
+  return session;
 }
 
 // --- API Layer ---
@@ -185,7 +248,7 @@ function toOpenAIMessages(messages: any[], systemPrompt: string): any[] {
 function trackCost(usage: SessionState["usage"], mdl: string, inputTok: number, outputTok: number) {
   usage.inputTokens += inputTok;
   usage.outputTokens += outputTok;
-  const costs = COST_PER_MTOK[mdl];
+  const costs = getCostPerMtok()[mdl];
   if (costs) usage.usd += (inputTok * costs[0] + outputTok * costs[1]) / 1_000_000;
 }
 
@@ -349,17 +412,70 @@ async function compactMessages(messages: any[], session: SessionState) {
 }
 
 async function summarizeToolResult(toolName: string, result: string, session: SessionState): Promise<string> {
-  if (result.split("\n").length < TOOL_SUMMARIZE_THRESHOLD) return result;
+  if (result.split("\n").length < getToolSummarizeThreshold()) return result;
   return (await quickLLM(session.provider,
     `Summarize this ${toolName} tool output concisely. Preserve key details: file structure, important line numbers, function names, error messages, and anything a coding assistant would need. Output only the summary.`,
     result,
   )) || result;
 }
 
+async function loadSkills(lastUserMessage: string): Promise<string> {
+  const skillDirs = [`${NANOCODE_DIR}/skills`, ".nanocode/skills"];
+  const skills: { name: string; content: string }[] = [];
+  const words = lastUserMessage.toLowerCase().split(/\W+/).filter(Boolean);
+  if (!words.length) return "";
+  for (const base of skillDirs) {
+    if (!existsSync(base)) continue;
+    try {
+      const entries = await readdir(base);
+      for (const entry of entries) {
+        const skillPath = `${base}/${entry}/SKILL.md`;
+        if (!existsSync(skillPath)) continue;
+        try {
+          const content = await readFile(skillPath, "utf-8");
+          const nameLC = entry.toLowerCase();
+          const matched = words.some((w) => nameLC.includes(w) || content.toLowerCase().includes(w));
+          if (matched) skills.push({ name: entry, content });
+        } catch {}
+      }
+    } catch {}
+  }
+  if (!skills.length) return "";
+  let result = "\n\n## Skills\n";
+  let budget = CONFIG.memory.skillTokenBudget;
+  for (const skill of skills) {
+    if (skill.content.length > budget) break;
+    result += `### ${skill.name}\n${skill.content}\n---\n`;
+    budget -= skill.content.length;
+  }
+  return result;
+}
+
 async function loadSystemPrompt(session: SessionState): Promise<string> {
   let prompt = `Concise coding assistant. cwd: ${session.cwd}`;
-  try { prompt += "\n\n" + await readFile(`${NANOCODE_DIR}/AGENTS.md`, "utf-8"); } catch {}
-  try { prompt += "\n\n" + await readFile("AGENTS.md", "utf-8"); } catch {}
+
+  // Load AGENTS.md (with per-agent override from routing)
+  const agentsFile = (session as any)._agentsFile;
+  if (agentsFile) {
+    try { prompt += "\n\n" + await readFile(agentsFile, "utf-8"); } catch {}
+  } else {
+    try { prompt += "\n\n" + await readFile(`${NANOCODE_DIR}/AGENTS.md`, "utf-8"); } catch {}
+    try { prompt += "\n\n" + await readFile("AGENTS.md", "utf-8"); } catch {}
+  }
+
+  // Load SOUL.md (personality/tone) from global and workspace
+  try { prompt += "\n\n" + await readFile(`${NANOCODE_DIR}/SOUL.md`, "utf-8"); } catch {}
+  try { prompt += "\n\n" + await readFile("SOUL.md", "utf-8"); } catch {}
+
+  // Load TOOLS.md (user conventions) from global and workspace
+  try { prompt += "\n\n" + await readFile(`${NANOCODE_DIR}/TOOLS.md`, "utf-8"); } catch {}
+  try { prompt += "\n\n" + await readFile("TOOLS.md", "utf-8"); } catch {}
+
+  // Skill injection: keyword-match skills from last user message
+  const lastUserMsg = [...session.messages].reverse().find((m: any) => m.role === "user" && typeof m.content === "string");
+  if (lastUserMsg) {
+    prompt += await loadSkills(lastUserMsg.content);
+  }
 
   // Load MEMORY.md for main sessions only (privacy)
   if (session.type === "main") {
@@ -368,12 +484,11 @@ async function loadSystemPrompt(session: SessionState): Promise<string> {
 
   // Inject relevant memories with token budget
   if (memoryDb) {
-    const lastUserMsg = [...session.messages].reverse().find((m: any) => m.role === "user" && typeof m.content === "string");
     if (lastUserMsg) {
       const memories = await memorySearchSemantic(lastUserMsg.content, 10);
       if (memories.length) {
         let injected = "\n\n## Relevant Memories\n";
-        let tokenBudget = MEMORY_INJECTION_MAX_TOKENS;
+        let tokenBudget = getMemoryInjectionMaxTokens();
         for (const mem of memories) {
           const memTokens = Math.ceil(mem.length / 4);
           if (memTokens > tokenBudget) break;
@@ -528,7 +643,7 @@ function memorySearch(query: string, limit: number = 5): string[] {
   try {
     // FTS5 search with relevance threshold
     const results = memoryDb.prepare("SELECT content, rank FROM memories_fts WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?").all(query, limit * 2) as any[];
-    return results.filter((r: any) => Math.abs(r.rank) >= MEMORY_RELEVANCE_THRESHOLD).slice(0, limit).map((r: any) => r.content);
+    return results.filter((r: any) => Math.abs(r.rank) >= getMemoryRelevanceThreshold()).slice(0, limit).map((r: any) => r.content);
   } catch {
     const results = memoryDb.prepare("SELECT content FROM memories WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?").all(`%${query}%`, limit) as any[];
     return results.map((r: any) => r.content);
@@ -544,7 +659,7 @@ async function memorySearchSemantic(query: string, limit: number = 5): Promise<s
   const scored = rows.map((r: any) => {
     const vec = new Float32Array(new Uint8Array(r.vector).buffer);
     return { content: r.content, score: cosineSimilarity(queryVec, vec) };
-  }).filter((r) => r.score >= MEMORY_RELEVANCE_THRESHOLD).sort((a, b) => b.score - a.score).slice(0, limit);
+  }).filter((r) => r.score >= getMemoryRelevanceThreshold()).sort((a, b) => b.score - a.score).slice(0, limit);
 
   return scored.map((r) => r.content);
 }
@@ -606,6 +721,52 @@ async function memoryFlush(oldMessages: any[], session: SessionState) {
       await writeFile(logPath, `# ${date}\n\n## ${new Date().toISOString()}\n${facts}`, "utf-8");
     }
   }
+}
+
+// --- Cron Jobs ---
+function initCronTable() {
+  if (!memoryDb) return;
+  memoryDb.run("CREATE TABLE IF NOT EXISTS cron_jobs (id TEXT PRIMARY KEY, schedule TEXT, task TEXT, sessionId TEXT, nextRun INTEGER, enabled INTEGER DEFAULT 1)");
+}
+
+function parseCronExpression(expr: string, now: Date): number {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return now.getTime() + 60000;
+  const [minExpr, hourExpr, dayExpr, monExpr, wdayExpr] = parts;
+  const matchField = (expr: string, val: number, max: number): boolean => {
+    if (expr === "*") return true;
+    if (expr.startsWith("*/")) { const step = parseInt(expr.slice(2)); return val % step === 0; }
+    return expr.split(",").some((p) => parseInt(p) === val);
+  };
+  const next = new Date(now);
+  next.setSeconds(0, 0);
+  next.setMinutes(next.getMinutes() + 1);
+  for (let i = 0; i < 1440 * 31; i++) { // scan up to ~31 days
+    if (matchField(minExpr, next.getMinutes(), 59) && matchField(hourExpr, next.getHours(), 23) &&
+        matchField(dayExpr, next.getDate(), 31) && matchField(monExpr, next.getMonth() + 1, 12) &&
+        matchField(wdayExpr, next.getDay(), 6)) {
+      return next.getTime();
+    }
+    next.setMinutes(next.getMinutes() + 1);
+  }
+  return now.getTime() + 3600000; // fallback: 1 hour
+}
+
+function startCronRunner() {
+  if (!memoryDb) return;
+  setInterval(async () => {
+    if (!memoryDb) return;
+    const now = Date.now();
+    const due = memoryDb.prepare("SELECT * FROM cron_jobs WHERE enabled = 1 AND nextRun <= ?").all(now) as any[];
+    for (const job of due) {
+      const session = getOrCreateSession(job.sessionId || "main", "main");
+      session.messages.push({ role: "user", content: `[Cron job: ${job.id}] ${job.task}` });
+      const systemPrompt = await loadSystemPrompt(session);
+      runAgentLoop(session.messages, systemPrompt, { session, sink: nullSink }); // fire and forget
+      const nextRun = parseCronExpression(job.schedule, new Date());
+      memoryDb.run("UPDATE cron_jobs SET nextRun = ? WHERE id = ?", [nextRun, job.id]);
+    }
+  }, 60000);
 }
 
 // --- Extension System ---
@@ -684,7 +845,7 @@ function isToolAllowed(toolName: string, session: SessionState): boolean {
   // Layer 1: Tool-specific profile
   if (policy.toolProfiles?.[toolName]) rules.push(...policy.toolProfiles[toolName]);
   // Layer 2: Provider profile
-  const provName = Object.entries(PROVIDERS).find(([_, p]) => p === session.provider)?.[0] ?? "";
+  const provName = Object.entries(getProviders()).find(([_, p]) => p === session.provider)?.[0] ?? "";
   if (policy.providerProfiles?.[provName]) rules.push(...policy.providerProfiles[provName]);
   // Layer 3: Global policy
   if (policy.global) rules.push(...policy.global);
@@ -728,7 +889,7 @@ function sandboxNetworkFlag(sessionId: string): string {
     if (policy.sandbox?.network === true) return "";
     if (policy.sandbox?.networkSessions?.includes(sessionId)) return "";
   } catch {}
-  return process.env.NANOCODE_SANDBOX_NETWORK === "true" ? "" : "--network none";
+  return CONFIG.sandbox.network ? "" : "--network none";
 }
 
 function createSandbox(sessionId: string): string | undefined {
@@ -795,19 +956,38 @@ async function loadDevicePairings() {
 
 function setupRemoteAccess() {
   if (REMOTE_MODE === "tailscale-serve") {
-    try { execSync(`tailscale serve --bg https+insecure://localhost:${GATEWAY_PORT}`, { stdio: "ignore", timeout: 10000 }); } catch {}
+    try { execSync(`tailscale serve --bg https+insecure://localhost:${getGatewayPort()}`, { stdio: "ignore", timeout: 10000 }); } catch {}
   } else if (REMOTE_MODE === "tailscale-funnel") {
-    try { execSync(`tailscale funnel --bg https+insecure://localhost:${GATEWAY_PORT}`, { stdio: "ignore", timeout: 10000 }); } catch {}
+    try { execSync(`tailscale funnel --bg https+insecure://localhost:${getGatewayPort()}`, { stdio: "ignore", timeout: 10000 }); } catch {}
   }
 }
 
 function startGateway() {
   try {
     gatewayServer = Bun.serve({
-      port: GATEWAY_PORT,
-      hostname: GATEWAY_HOST,
+      port: getGatewayPort(),
+      hostname: getGatewayHost(),
       fetch(req: Request, server: any) {
         if (server.upgrade(req)) return undefined;
+        const url = new URL(req.url);
+        // Webhook endpoint
+        if (req.method === "POST" && url.pathname === "/webhook") {
+          return (async () => {
+            try {
+              const body = await req.json() as any;
+              const secret = process.env.NANOCODE_WEBHOOK_SECRET ?? "";
+              if (secret && body.secret !== secret) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+              const sessionId = body.sessionId ?? "main";
+              const text = body.text ?? "";
+              if (!text) return new Response(JSON.stringify({ error: "missing text" }), { status: 400, headers: { "Content-Type": "application/json" } });
+              const session = getOrCreateSession(sessionId, "main");
+              session.messages.push({ role: "user", content: `[Webhook] ${text}` });
+              const sysPrompt = await loadSystemPrompt(session);
+              runAgentLoop(session.messages, sysPrompt, { session, sink: nullSink }); // fire and forget
+              return new Response(JSON.stringify({ ok: true, sessionId }), { headers: { "Content-Type": "application/json" } });
+            } catch (e) { return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { "Content-Type": "application/json" } }); }
+          })();
+        }
         return new Response(JSON.stringify({ status: "nanocode gateway", sessions: sessions.size }), { headers: { "Content-Type": "application/json" } });
       },
       websocket: {
@@ -915,14 +1095,14 @@ function isSlackAllowed(userId: string, channelId: string): boolean {
 
 // Rate limiting
 const slackRateLimits = new Map<string, number[]>(); // userId -> timestamps
-const SLACK_RATE_LIMIT_WINDOW = 60000; // 1 minute
-const SLACK_RATE_LIMIT_MAX = 10; // max messages per window
+const getSlackRateLimitWindow = () => CONFIG.adapters.slack.rateLimitWindow;
+const getSlackRateLimitMax = () => CONFIG.adapters.slack.rateLimitMax;
 
 function checkSlackRateLimit(userId: string): boolean {
   const now = Date.now();
   const timestamps = slackRateLimits.get(userId) ?? [];
-  const recent = timestamps.filter((t) => now - t < SLACK_RATE_LIMIT_WINDOW);
-  if (recent.length >= SLACK_RATE_LIMIT_MAX) return false;
+  const recent = timestamps.filter((t) => now - t < getSlackRateLimitWindow());
+  if (recent.length >= getSlackRateLimitMax()) return false;
   recent.push(now);
   slackRateLimits.set(userId, recent);
   return true;
@@ -1147,6 +1327,141 @@ async function handleDiscordMessage(msg: any, botToken: string) {
   }
 }
 
+// --- Canvas Server (A2UI) ---
+const canvasClients = new Set<any>();
+let canvasServer: any = null;
+
+function getCanvasHTML(): string {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>nanocode canvas</title>
+<style>body{font-family:system-ui,sans-serif;margin:20px;background:#1a1a2e;color:#e0e0e0}#canvas-root{padding:20px;border-radius:8px;background:#16213e;min-height:200px}
+button,[a2ui-action]{cursor:pointer;background:#0f3460;color:#e0e0e0;border:1px solid #533483;padding:8px 16px;border-radius:4px;margin:4px}
+button:hover,[a2ui-action]:hover{background:#533483}input,textarea{background:#0f3460;color:#e0e0e0;border:1px solid #533483;padding:8px;border-radius:4px;margin:4px}
+.status{font-size:12px;color:#666;margin-top:10px}</style></head><body>
+<div id="canvas-root"><p>Waiting for agent content...</p></div><div class="status" id="status">Connecting...</div>
+<script>
+const ws=new WebSocket("ws://localhost:${CONFIG.canvas.port}");
+ws.onopen=()=>{document.getElementById("status").textContent="Connected";};
+ws.onclose=()=>{document.getElementById("status").textContent="Disconnected";};
+ws.onmessage=(e)=>{
+  try{const msg=JSON.parse(e.data);
+    if(msg.type==="render"){
+      document.getElementById("canvas-root").innerHTML=msg.html;
+      document.querySelectorAll("[a2ui-action]").forEach(el=>{
+        el.addEventListener("click",()=>{
+          const action=el.getAttribute("a2ui-action");
+          const params={};
+          for(const attr of el.attributes){if(attr.name.startsWith("a2ui-param-"))params[attr.name.slice(11)]=attr.value;}
+          ws.send(JSON.stringify({type:"action",action,params}));
+        });
+      });
+    }
+  }catch{}
+};
+</script></body></html>`;
+}
+
+function startCanvasServer() {
+  try {
+    canvasServer = Bun.serve({
+      port: CONFIG.canvas.port,
+      hostname: "127.0.0.1",
+      fetch(req: Request, server: any) {
+        if (server.upgrade(req)) return undefined;
+        return new Response(getCanvasHTML(), { headers: { "Content-Type": "text/html" } });
+      },
+      websocket: {
+        open(ws: any) { canvasClients.add(ws); },
+        close(ws: any) { canvasClients.delete(ws); },
+        message(ws: any, raw: any) {
+          try {
+            const msg = JSON.parse(String(raw));
+            if (msg.type === "action") {
+              // Inject canvas action into main session
+              const mainSession = sessions.get("main");
+              if (mainSession) {
+                mainSession.messages.push({ role: "user", content: `[Canvas action: ${msg.action}] params: ${JSON.stringify(msg.params)}` });
+                loadSystemPrompt(mainSession).then((sp) => runAgentLoop(mainSession.messages, sp, { session: mainSession, sink: stdoutSink }));
+              }
+            }
+          } catch {}
+        },
+      },
+    });
+  } catch {}
+}
+
+function canvasBroadcast(html: string) {
+  const data = JSON.stringify({ type: "render", html });
+  for (const ws of canvasClients) { try { ws.send(data); } catch {} }
+}
+
+// --- Browser Automation ---
+let browserProc: any = null;
+let browserWsUrl: string | null = null;
+let browserLastActivity = 0;
+let browserPageId: string | null = null;
+
+async function ensureBrowser(session?: SessionState): Promise<string> {
+  if (browserWsUrl && Date.now() - browserLastActivity < 300000) { browserLastActivity = Date.now(); return browserWsUrl; }
+  // Close old browser if exists
+  if (browserProc) { try { browserProc.kill(); } catch {} browserProc = null; browserWsUrl = null; }
+  const cmd = session?.containerId
+    ? ["docker", "exec", session.containerId, "chromium", "--headless", "--no-sandbox", "--remote-debugging-port=9222"]
+    : ["chromium", "--headless", "--no-sandbox", "--remote-debugging-port=9222"];
+  browserProc = Bun.spawn(cmd, { stdio: ["ignore", "ignore", "ignore"] });
+  // Wait for CDP to be ready
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch("http://localhost:9222/json");
+      if (res.ok) { const pages = await res.json() as any[]; if (pages.length) { browserWsUrl = pages[0].webSocketDebuggerUrl; browserPageId = pages[0].id; break; } }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (!browserWsUrl) throw new Error("Failed to connect to browser CDP");
+  browserLastActivity = Date.now();
+  return browserWsUrl;
+}
+
+async function cdpCommand(method: string, params: any = {}): Promise<any> {
+  const targetUrl = `http://localhost:9222/json`;
+  // Use HTTP-based CDP protocol via fetch
+  if (method === "Page.navigate") {
+    await fetch(`http://localhost:9222/json/navigate?${browserPageId}&url=${encodeURIComponent(params.url)}`).catch(() => {});
+    await new Promise((r) => setTimeout(r, 2000)); // wait for page load
+    const evalRes = await cdpCommand("Runtime.evaluate", { expression: "JSON.stringify({title: document.title, text: document.body?.innerText?.slice(0, 10000) || ''})" });
+    return evalRes;
+  }
+  // For all commands, use Runtime.evaluate via the /json/protocol
+  const pageRes = await fetch(targetUrl);
+  if (!pageRes.ok) throw new Error("CDP not available");
+  const pages = await pageRes.json() as any[];
+  const page = pages[0];
+  if (!page) throw new Error("No browser page");
+
+  // Use the evaluate endpoint
+  const body: any = { id: 1, method, params };
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { ws.close(); reject(new Error("CDP timeout")); }, 10000);
+    ws.onopen = () => { ws.send(JSON.stringify(body)); };
+    ws.onmessage = (evt: MessageEvent) => {
+      clearTimeout(timeout);
+      const data = JSON.parse(String(evt.data));
+      ws.close();
+      if (data.error) reject(new Error(data.error.message));
+      else resolve(data.result);
+    };
+    ws.onerror = () => { clearTimeout(timeout); reject(new Error("CDP WebSocket error")); };
+  });
+}
+
+// Auto-close browser after 5 min inactivity
+setInterval(() => {
+  if (browserProc && Date.now() - browserLastActivity > 300000) {
+    try { browserProc.kill(); } catch {} browserProc = null; browserWsUrl = null;
+  }
+}, 60000);
+
 // --- Tools ---
 const TOOLS: Record<string, Tool> = {
   read: {
@@ -1307,6 +1622,71 @@ const TOOLS: Record<string, Tool> = {
     desc: "Save information to long-term memory", params: ["content", "tags"],
     fn: (args) => { memorySave(args.content, args.tags ?? "", "agent"); return "Memory saved"; },
   },
+  // Canvas tool
+  canvas: {
+    desc: "Send HTML content to render in the canvas browser UI. Supports a2ui-action and a2ui-param-* attributes for interactive elements.", params: ["html"],
+    fn: (args) => { canvasBroadcast(args.html); return `Canvas updated (${canvasClients.size} clients connected)`; },
+  },
+  // Browser automation
+  browser: {
+    desc: "Browser automation: actions are navigate (go to url), screenshot (capture page), click (click selector), type (type text into selector), extract (extract text from selector or page)", params: ["action"],
+    fn: async (args, session) => {
+      await ensureBrowser(session);
+      browserLastActivity = Date.now();
+      const action = args.action;
+      if (action === "navigate") {
+        if (!args.url) return "url required for navigate";
+        await cdpCommand("Page.navigate", { url: args.url });
+        const res = await cdpCommand("Runtime.evaluate", { expression: "JSON.stringify({title: document.title, text: document.body?.innerText?.slice(0, 8000) || ''})" });
+        try { const parsed = JSON.parse(res?.value ?? res?.result?.value ?? "{}"); return `Title: ${parsed.title}\n\n${parsed.text}`; } catch { return String(res); }
+      } else if (action === "screenshot") {
+        const res = await cdpCommand("Page.captureScreenshot", { format: "png" });
+        return `data:image/png;base64,${res?.data ?? ""}`;
+      } else if (action === "click") {
+        if (!args.selector) return "selector required for click";
+        await cdpCommand("Runtime.evaluate", { expression: `document.querySelector(${JSON.stringify(args.selector)})?.click()` });
+        return "clicked";
+      } else if (action === "type") {
+        if (!args.selector || !args.text) return "selector and text required for type";
+        await cdpCommand("Runtime.evaluate", { expression: `(function(){var el=document.querySelector(${JSON.stringify(args.selector)});if(el){el.focus();el.value=${JSON.stringify(args.text)};el.dispatchEvent(new Event('input',{bubbles:true}))}})()` });
+        return "typed";
+      } else if (action === "extract") {
+        const sel = args.selector ? `document.querySelector(${JSON.stringify(args.selector)})?.innerText || ''` : `document.body?.innerText?.slice(0, 10000) || ''`;
+        const res = await cdpCommand("Runtime.evaluate", { expression: sel });
+        return res?.value ?? res?.result?.value ?? "";
+      }
+      return `Unknown browser action: ${action}`;
+    },
+  },
+  // Cron tools
+  cron_create: {
+    desc: "Schedule a recurring task with a cron expression (e.g. '*/5 * * * *')", params: ["schedule", "task"], mainOnly: true,
+    fn: (args, session) => {
+      if (!memoryDb) return "Memory DB not available";
+      const id = randomUUID().slice(0, 8);
+      const nextRun = parseCronExpression(args.schedule, new Date());
+      const sessionId = session?.id ?? "main";
+      memoryDb.run("INSERT INTO cron_jobs (id, schedule, task, sessionId, nextRun, enabled) VALUES (?, ?, ?, ?, ?, 1)", [id, args.schedule, args.task, sessionId, nextRun]);
+      return `Cron job created: ${id} (next run: ${new Date(nextRun).toISOString()})`;
+    },
+  },
+  cron_list: {
+    desc: "List all scheduled cron jobs", params: [],
+    fn: () => {
+      if (!memoryDb) return "Memory DB not available";
+      const jobs = memoryDb.prepare("SELECT * FROM cron_jobs").all() as any[];
+      if (!jobs.length) return "No cron jobs";
+      return jobs.map((j: any) => `${j.id} | ${j.schedule} | ${j.enabled ? "enabled" : "disabled"} | next: ${new Date(j.nextRun).toISOString()} | ${j.task.slice(0, 60)}`).join("\n");
+    },
+  },
+  cron_delete: {
+    desc: "Delete a scheduled cron job by ID", params: ["id"], mainOnly: true,
+    fn: (args) => {
+      if (!memoryDb) return "Memory DB not available";
+      memoryDb.run("DELETE FROM cron_jobs WHERE id = ?", [args.id]);
+      return `Cron job ${args.id} deleted`;
+    },
+  },
 };
 
 // --- Agent Loop ---
@@ -1333,7 +1713,7 @@ async function runAgentLoop(messages: any[], systemPrompt: string, opts: AgentOp
 
       if (compact) {
         const tokens = await countTokens(messages, systemPrompt, session);
-        if (tokens > COMPACT_THRESHOLD) await compactMessages(messages, session);
+        if (tokens > getCompactThreshold()) await compactMessages(messages, session);
       }
 
       const response = await streamLLM(messages, systemPrompt, filteredTools, session, sink);
@@ -1378,6 +1758,58 @@ async function runAgentLoop(messages: any[], systemPrompt: string, opts: AgentOp
   return lastText;
 }
 
+// --- Voice (Push-to-Talk) ---
+let voiceMode = false;
+
+async function recordAudio(): Promise<Buffer | null> {
+  try {
+    // Use sox to record up to 10 seconds of audio
+    const proc = Bun.spawn(["rec", "-q", "-t", "wav", "-", "trim", "0", "10"], { stdout: "pipe", stderr: "ignore" });
+    const chunks: Uint8Array[] = [];
+    const reader = proc.stdout.getReader();
+    // Read until process ends or timeout
+    const timeout = setTimeout(() => { try { proc.kill(); } catch {} }, 11000);
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    clearTimeout(timeout);
+    const total = chunks.reduce((acc, c) => acc + c.length, 0);
+    const buf = Buffer.alloc(total);
+    let offset = 0;
+    for (const chunk of chunks) { buf.set(chunk, offset); offset += chunk.length; }
+    return buf.length > 0 ? buf : null;
+  } catch { return null; }
+}
+
+async function speechToText(audioBuffer: Buffer): Promise<string> {
+  const formData = new FormData();
+  formData.append("model", "whisper-1");
+  formData.append("file", new Blob([audioBuffer], { type: "audio/wav" }), "audio.wav");
+  const key = process.env.OPENAI_API_KEY ?? "";
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}` },
+    body: formData,
+  });
+  if (!res.ok) throw new Error(`STT failed: ${res.status}`);
+  const data = await res.json() as any;
+  return data.text ?? "";
+}
+
+async function textToSpeech(text: string): Promise<void> {
+  const key = process.env.OPENAI_API_KEY ?? "";
+  const res = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: CONFIG.voice.model, input: text.slice(0, 4096), voice: CONFIG.voice.voice, speed: CONFIG.voice.speed }),
+  });
+  if (!res.ok) return;
+  const audioBuffer = Buffer.from(await res.arrayBuffer());
+  try { const proc = Bun.spawn(["ffplay", "-nodisp", "-autoexit", "-"], { stdin: "pipe" }); proc.stdin.write(audioBuffer); proc.stdin.end(); } catch {}
+}
+
 // --- REPL Commands ---
 const COMMANDS = new Map<string, (args: string, session: SessionState, sink: OutputSink) => Promise<boolean | void>>();
 
@@ -1407,8 +1839,8 @@ COMMANDS.set("/load", async (args, session, sink) => {
 COMMANDS.set("/model", async (args, session, sink) => {
   const arg = args.trim();
   const [p, m] = arg.includes(":") ? arg.split(":") : [null, arg];
-  if (p && PROVIDERS[p]) { session.provider = PROVIDERS[p]; session.model = m || session.provider.defaultModel; }
-  else if (p) { sink.log(`${ANSI.red}Unknown provider: ${p}. Available: ${Object.keys(PROVIDERS).join(", ")}${ANSI.reset}`); return; }
+  if (p && getProviders()[p]) { session.provider = getProviders()[p]; session.model = m || session.provider.defaultModel; }
+  else if (p) { sink.log(`${ANSI.red}Unknown provider: ${p}. Available: ${Object.keys(getProviders()).join(", ")}${ANSI.reset}`); return; }
   else { session.model = m; }
   await fireHook("model_select", { session, model: session.model });
   sink.log(`${ANSI.green}⏺ Model: ${session.model}${ANSI.reset}`);
@@ -1439,12 +1871,21 @@ COMMANDS.set("/memory", async (args, _, sink) => {
   const results = memorySearch(query);
   sink.log(results.length ? results.join("\n---\n") : "No memories found");
 });
+COMMANDS.set("/voice", async (_, __, sink) => {
+  voiceMode = !voiceMode;
+  sink.log(`${ANSI.green}⏺ Voice mode: ${voiceMode ? "ON" : "OFF"}${ANSI.reset}`);
+  if (voiceMode) sink.log(`${ANSI.dim}Press Enter with empty input to record (10s max). Requires sox/ffplay.${ANSI.reset}`);
+});
 
 // --- Main ---
 async function main() {
+  // Load configuration
+  loadConfig();
   // Initialize subsystems
   await mkdir(NANOCODE_DIR, { recursive: true });
   await initMemory();
+  initCronTable();
+  startCronRunner();
   await loadDevicePairings();
   // Parse extension flags from argv
   for (const arg of process.argv.slice(2)) {
@@ -1454,6 +1895,7 @@ async function main() {
   const mainSession = createSession("main", "main", { cwd: process.cwd() });
   await loadExtensions(mainSession);
   startGateway();
+  startCanvasServer();
   setupRemoteAccess();
   connectSlack(); // non-blocking, no await
   connectDiscord(); // non-blocking, no await
@@ -1470,9 +1912,10 @@ ${ANSI.bold}${ANSI.cyan}
  ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
 ${ANSI.reset}
 ${ANSI.dim}nanocode${ANSI.reset} | ${ANSI.dim}${mainSession.model}${ANSI.reset} | ${ANSI.dim}${process.cwd()}${ANSI.reset}
-${gatewayServer ? `${ANSI.dim}gateway: ${GATEWAY_HOST}:${GATEWAY_PORT}${ANSI.reset}` : ""}
+${gatewayServer ? `${ANSI.dim}gateway: ${getGatewayHost()}:${getGatewayPort()}${ANSI.reset}` : ""}
 ${slackBotUserId ? `${ANSI.dim}slack: connected${ANSI.reset}` : ""}
 ${discordBotUserId ? `${ANSI.dim}discord: connected${ANSI.reset}` : ""}
+${canvasServer ? `${ANSI.dim}canvas: 127.0.0.1:${CONFIG.canvas.port}${ANSI.reset}` : ""}
 `);
 
   const separator = () => console.log(`${ANSI.dim}${"─".repeat(80)}${ANSI.reset}`);
@@ -1484,12 +1927,24 @@ ${discordBotUserId ? `${ANSI.dim}discord: connected${ANSI.reset}` : ""}
       rl.question(`${ANSI.bold}${ANSI.blue}❯${ANSI.reset} `, (answer: string) => resolve(answer.trim()));
     });
     separator();
-    if (!input) continue;
+
+    // Voice mode: empty input triggers recording
+    let userInput = input;
+    if (!userInput && voiceMode) {
+      console.log(`${ANSI.yellow}🎤 Recording... (press Ctrl+C to stop, max 10s)${ANSI.reset}`);
+      const audio = await recordAudio();
+      if (audio) {
+        console.log(`${ANSI.dim}Transcribing...${ANSI.reset}`);
+        try { userInput = await speechToText(audio); console.log(`${ANSI.cyan}⏺ You said:${ANSI.reset} ${userInput}`); }
+        catch (e) { console.log(`${ANSI.red}STT error: ${e}${ANSI.reset}`); continue; }
+      } else { continue; }
+    }
+    if (!userInput) continue;
 
     // Command dispatch
-    const spaceIdx = input.indexOf(" ");
-    const cmdName = spaceIdx > 0 ? input.slice(0, spaceIdx) : input;
-    const cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : "";
+    const spaceIdx = userInput.indexOf(" ");
+    const cmdName = spaceIdx > 0 ? userInput.slice(0, spaceIdx) : userInput;
+    const cmdArgs = spaceIdx > 0 ? userInput.slice(spaceIdx + 1) : "";
 
     const handler = COMMANDS.get(cmdName) ?? extCommands.get(cmdName);
     if (handler) {
@@ -1498,9 +1953,18 @@ ${discordBotUserId ? `${ANSI.dim}discord: connected${ANSI.reset}` : ""}
       continue;
     }
 
-    mainSession.messages.push({ role: "user", content: input });
+    mainSession.messages.push({ role: "user", content: userInput });
     const currentPrompt = await loadSystemPrompt(mainSession);
     await runAgentLoop(mainSession.messages, currentPrompt, { session: mainSession, sink: stdoutSink });
+
+    // Voice TTS: speak the response
+    if (voiceMode) {
+      const lastAssistant = [...mainSession.messages].reverse().find((m: any) => m.role === "assistant");
+      if (lastAssistant) {
+        const txt = Array.isArray(lastAssistant.content) ? lastAssistant.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") : String(lastAssistant.content);
+        if (txt) await textToSpeech(txt);
+      }
+    }
     console.log();
   }
 
