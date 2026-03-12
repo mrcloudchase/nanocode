@@ -66,6 +66,76 @@ const SESSIONS_DIR = `${NANOCODE_DIR}/sessions`;
 const MEMORY_DIR = `${NANOCODE_DIR}/memory`;
 const EXTENSIONS_DIRS = [`${NANOCODE_DIR}/extensions`, ".nanocode/extensions"];
 
+// --- .env file loading (critical for daemon mode which doesn't inherit shell env) ---
+function loadEnvFile() {
+  try {
+    const content = require("fs").readFileSync(`${NANOCODE_DIR}/.env`, "utf-8");
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq > 0) {
+        const key = trimmed.slice(0, eq).trim();
+        let val = trimmed.slice(eq + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+        if (!process.env[key]) process.env[key] = val; // don't override existing env vars
+      }
+    }
+  } catch {}
+}
+
+// --- Daemon ---
+const PID_FILE = `${NANOCODE_DIR}/daemon.pid`;
+const LOG_FILE = `${NANOCODE_DIR}/daemon.log`;
+
+function readPidFile(): number | null {
+  try { return parseInt(require("fs").readFileSync(PID_FILE, "utf-8").trim(), 10); }
+  catch { return null; }
+}
+
+function isDaemonRunning(): { running: boolean; pid: number | null } {
+  const pid = readPidFile();
+  if (!pid) return { running: false, pid: null };
+  try { process.kill(pid, 0); return { running: true, pid }; }
+  catch { try { require("fs").unlinkSync(PID_FILE); } catch {} return { running: false, pid: null }; }
+}
+
+function daemonStart() {
+  const status = isDaemonRunning();
+  if (status.running) { console.log(`Daemon already running (PID ${status.pid})`); return; }
+  require("fs").mkdirSync(NANOCODE_DIR, { recursive: true });
+  const logFd = require("fs").openSync(LOG_FILE, "a");
+  const { spawn } = require("child_process");
+  const child = spawn(process.execPath, [process.argv[1], "--daemon"], { detached: true, stdio: ["ignore", logFd, logFd] });
+  child.unref();
+  console.log(`Daemon started (PID ${child.pid})`);
+  console.log(`Logs: ${LOG_FILE}`);
+}
+
+function daemonStop() {
+  const status = isDaemonRunning();
+  if (!status.running) { console.log("Daemon not running"); return; }
+  try { process.kill(status.pid!, "SIGTERM"); } catch {}
+  try { require("fs").unlinkSync(PID_FILE); } catch {}
+  console.log(`Daemon stopped (PID ${status.pid})`);
+}
+
+function daemonStatus() {
+  const status = isDaemonRunning();
+  if (status.running) {
+    console.log(`Daemon running (PID ${status.pid})`);
+    console.log(`Gateway: ${getGatewayHost()}:${getGatewayPort()}`);
+    console.log(`Logs: ${LOG_FILE}`);
+    try {
+      const log = require("fs").readFileSync(LOG_FILE, "utf-8");
+      const lines = log.split("\n").filter(Boolean).slice(-5);
+      if (lines.length) console.log(`Recent log:\n  ${lines.join("\n  ")}`);
+    } catch {}
+  } else {
+    console.log("Daemon not running");
+  }
+}
+
 // Accessors that read from CONFIG (set after loadConfig)
 const getCompactThreshold = () => CONFIG.memory.compactThreshold;
 const getToolSummarizeThreshold = () => CONFIG.memory.toolSummarizeThreshold;
@@ -119,7 +189,7 @@ interface GatewayMessage {
 // Gateway JSON Schema validation
 const GATEWAY_SCHEMA: Record<string, { required: string[]; optional: string[] }> = {
   heartbeat: { required: ["type"], optional: ["idempotencyKey"] },
-  message: { required: ["type", "source", "text"], optional: ["idempotencyKey", "sessionId", "media"] },
+  message: { required: ["type", "text"], optional: ["idempotencyKey", "sessionId", "source", "media"] },
   subscribe: { required: ["type"], optional: ["idempotencyKey", "sessionId"] },
   auth: { required: ["type"], optional: ["password", "challenge", "signature"] },
 };
@@ -1038,19 +1108,32 @@ async function handleGatewayMessage(ws: any, msg: GatewayMessage) {
     return;
   }
 
-  if (msg.type === "message" && msg.source && msg.text) {
-    const sessionType: SessionType = msg.source.channel.startsWith("D") ? "dm" : "group";
-    const sessionId = `${sessionType}:${msg.source.platform}:${msg.source.channel}:${msg.source.user}`;
-    const session = getOrCreateSession(sessionId, sessionType);
+  if (msg.type === "message" && msg.text) {
+    let sessionId: string;
+    let session: SessionState;
 
-    // Create sandbox for non-main sessions if Docker available
-    if (session.type !== "main" && !session.containerId && checkDocker()) {
-      session.containerId = createSandbox(sessionId);
+    if (msg.sessionId === "main") {
+      // REPL/local client targeting the main session directly
+      sessionId = "main";
+      session = getOrCreateSession("main", "main");
+      session.messages.push({ role: "user", content: msg.text });
+    } else if (msg.source) {
+      const sessionType: SessionType = msg.source.channel.startsWith("D") ? "dm" : "group";
+      sessionId = `${sessionType}:${msg.source.platform}:${msg.source.channel}:${msg.source.user}`;
+      session = getOrCreateSession(sessionId, sessionType);
+
+      // Create sandbox for non-main sessions if Docker available
+      if (session.type !== "main" && !session.containerId && checkDocker()) {
+        session.containerId = createSandbox(sessionId);
+      }
+
+      // Wrap with source metadata for prompt injection defense
+      const wrappedContent = `<source platform="${msg.source.platform}" user="${msg.source.user}" channel="${msg.source.channel}">\n${msg.text}\n</source>`;
+      session.messages.push({ role: "user", content: wrappedContent });
+    } else {
+      ws.send(JSON.stringify({ type: "error", error: "message requires source or sessionId='main'" }));
+      return;
     }
-
-    // Wrap with source metadata for prompt injection defense
-    const wrappedContent = `<source platform="${msg.source.platform}" user="${msg.source.user}" channel="${msg.source.channel}">\n${msg.text}\n</source>`;
-    session.messages.push({ role: "user", content: wrappedContent });
 
     const sink = wsSink(ws, sessionId);
     const systemPrompt = await loadSystemPrompt(session);
@@ -1876,31 +1959,195 @@ COMMANDS.set("/voice", async (_, __, sink) => {
   sink.log(`${ANSI.green}⏺ Voice mode: ${voiceMode ? "ON" : "OFF"}${ANSI.reset}`);
   if (voiceMode) sink.log(`${ANSI.dim}Press Enter with empty input to record (10s max). Requires sox/ffplay.${ANSI.reset}`);
 });
+COMMANDS.set("/daemon", async (args, _, sink) => {
+  const sub = args.trim().split(/\s+/)[0] || "status";
+  if (sub === "start") daemonStart();
+  else if (sub === "stop") daemonStop();
+  else if (sub === "status") daemonStatus();
+  else sink.log("Usage: /daemon [start|stop|status]");
+});
+
+// --- Gateway reachability check ---
+async function isGatewayReachable(host: string, port: number): Promise<boolean> {
+  try { const res = await fetch(`http://${host}:${port}/`); return res.ok; }
+  catch { return false; }
+}
+
+// --- REPL over WebSocket ---
+async function runReplOverWebSocket(gatewayUrl: string, mainSession: SessionState) {
+  return new Promise<void>((resolve) => {
+    const ws = new WebSocket(gatewayUrl);
+    let responseResolve: (() => void) | null = null;
+
+    ws.onclose = () => { console.log(`${ANSI.dim}Disconnected from gateway${ANSI.reset}`); resolve(); };
+    ws.onerror = () => { console.log(`${ANSI.red}Gateway connection error${ANSI.reset}`); resolve(); };
+
+    ws.onmessage = (evt: MessageEvent) => {
+      try {
+        const msg = JSON.parse(String(evt.data));
+        if (msg.type === "stream_delta") {
+          process.stdout.write(msg.text);
+        } else if (msg.type === "log") {
+          console.log(msg.text);
+        } else if (msg.type === "message_end") {
+          console.log();
+          if (responseResolve) { responseResolve(); responseResolve = null; }
+        } else if (msg.type === "error") {
+          console.log(`${ANSI.red}Gateway error: ${msg.error}${ANSI.reset}`);
+          if (responseResolve) { responseResolve(); responseResolve = null; }
+        }
+      } catch {}
+    };
+
+    const separator = () => console.log(`${ANSI.dim}${"─".repeat(80)}${ANSI.reset}`);
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    const promptLoop = async () => {
+      while (true) {
+        separator();
+        const input = await new Promise<string>((res) => {
+          rl.question(`${ANSI.bold}${ANSI.blue}❯${ANSI.reset} `, (answer: string) => res(answer.trim()));
+        });
+        separator();
+
+        // Voice mode: empty input triggers recording
+        let userInput = input;
+        if (!userInput && voiceMode) {
+          console.log(`${ANSI.yellow}🎤 Recording... (press Ctrl+C to stop, max 10s)${ANSI.reset}`);
+          const audio = await recordAudio();
+          if (audio) {
+            console.log(`${ANSI.dim}Transcribing...${ANSI.reset}`);
+            try { userInput = await speechToText(audio); console.log(`${ANSI.cyan}⏺ You said:${ANSI.reset} ${userInput}`); }
+            catch (e) { console.log(`${ANSI.red}STT error: ${e}${ANSI.reset}`); continue; }
+          } else { continue; }
+        }
+        if (!userInput) continue;
+
+        // Local command dispatch
+        const spaceIdx = userInput.indexOf(" ");
+        const cmdName = spaceIdx > 0 ? userInput.slice(0, spaceIdx) : userInput;
+        const cmdArgs = spaceIdx > 0 ? userInput.slice(spaceIdx + 1) : "";
+
+        const handler = COMMANDS.get(cmdName) ?? extCommands.get(cmdName);
+        if (handler) {
+          const shouldExit = await handler(cmdArgs, mainSession, stdoutSink);
+          if (shouldExit === true) break;
+          continue;
+        }
+
+        // Send chat message through the gateway
+        ws.send(JSON.stringify({ type: "message", sessionId: "main", text: userInput }));
+
+        // Wait for message_end before showing next prompt
+        await new Promise<void>((res) => { responseResolve = res; });
+
+        // Voice TTS
+        if (voiceMode) {
+          const lastAssistant = [...mainSession.messages].reverse().find((m: any) => m.role === "assistant");
+          if (lastAssistant) {
+            const txt = Array.isArray(lastAssistant.content) ? lastAssistant.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") : String(lastAssistant.content);
+            if (txt) await textToSpeech(txt);
+          }
+        }
+      }
+
+      rl.close();
+      ws.close();
+    };
+
+    ws.addEventListener("open", () => { promptLoop(); });
+  });
+}
 
 // --- Main ---
 async function main() {
+  // Load .env file (critical for daemon mode which doesn't inherit shell env)
+  loadEnvFile();
+
+  // Handle daemon CLI subcommands: nanocode daemon start|stop|status
+  const cliArgs = process.argv.slice(2);
+  if (cliArgs[0] === "daemon") {
+    loadConfig();
+    const sub = cliArgs[1] ?? "status";
+    if (sub === "start") daemonStart();
+    else if (sub === "stop") daemonStop();
+    else if (sub === "status") daemonStatus();
+    else console.log("Usage: nanocode daemon [start|stop|status]");
+    return;
+  }
+  const isDaemonMode = cliArgs.includes("--daemon");
+
   // Load configuration
   loadConfig();
-  // Initialize subsystems
-  await mkdir(NANOCODE_DIR, { recursive: true });
-  await initMemory();
-  initCronTable();
-  startCronRunner();
-  await loadDevicePairings();
-  // Parse extension flags from argv
-  for (const arg of process.argv.slice(2)) {
-    const match = arg.match(/^--(\w+)=(.+)$/);
-    if (match && extFlags.has(match[1])) extFlags.get(match[1])!.value = match[2];
-  }
-  const mainSession = createSession("main", "main", { cwd: process.cwd() });
-  await loadExtensions(mainSession);
-  startGateway();
-  startCanvasServer();
-  setupRemoteAccess();
-  connectSlack(); // non-blocking, no await
-  connectDiscord(); // non-blocking, no await
 
-  const systemPrompt = await loadSystemPrompt(mainSession);
+  // --- Daemon mode: headless, no REPL ---
+  if (isDaemonMode) {
+    await mkdir(NANOCODE_DIR, { recursive: true });
+    await initMemory();
+    initCronTable();
+    startCronRunner();
+    await loadDevicePairings();
+    const mainSession = createSession("main", "main", { cwd: process.cwd() });
+    await loadExtensions(mainSession);
+    startGateway();
+    startCanvasServer();
+    setupRemoteAccess();
+    connectSlack();
+    connectDiscord();
+
+    require("fs").writeFileSync(PID_FILE, String(process.pid));
+    const cleanup = async () => {
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] nanocode daemon shutting down`);
+      await fireHook("session_shutdown", { session: mainSession });
+      for (const [_, s] of sessions) { if (s.containerId) destroySandbox(s.containerId); }
+      if (slackSocket) slackSocket.close();
+      if (discordWs) discordWs.close();
+      try { require("fs").unlinkSync(PID_FILE); } catch {}
+      process.exit(0);
+    };
+    process.on("SIGTERM", cleanup);
+    process.on("SIGINT", cleanup);
+    const ts = new Date().toISOString();
+    console.log(`[${ts}] nanocode daemon started (PID ${process.pid})`);
+    console.log(`[${ts}] gateway: ${getGatewayHost()}:${getGatewayPort()}`);
+    if (canvasServer) console.log(`[${ts}] canvas: 127.0.0.1:${CONFIG.canvas.port}`);
+    return;
+  }
+
+  // --- Interactive mode ---
+  const host = getGatewayHost();
+  const port = getGatewayPort();
+  const externalDaemon = await isGatewayReachable(host, port);
+
+  let mainSession: SessionState;
+
+  if (!externalDaemon) {
+    // Embedded mode: no daemon running, start gateway and all subsystems in-process
+    await mkdir(NANOCODE_DIR, { recursive: true });
+    await initMemory();
+    initCronTable();
+    startCronRunner();
+    await loadDevicePairings();
+    for (const arg of process.argv.slice(2)) {
+      const match = arg.match(/^--(\w+)=(.+)$/);
+      if (match && extFlags.has(match[1])) extFlags.get(match[1])!.value = match[2];
+    }
+    mainSession = createSession("main", "main", { cwd: process.cwd() });
+    await loadExtensions(mainSession);
+    startGateway();
+    startCanvasServer();
+    setupRemoteAccess();
+    connectSlack();
+    connectDiscord();
+  } else {
+    // Thin client mode: daemon is running, create local session for management commands only
+    mainSession = createSession("main", "main", { cwd: process.cwd() });
+    await loadExtensions(mainSession);
+  }
+
+  const gatewayUrl = `ws://${host}:${port}`;
+  const modeLabel = externalDaemon ? `connected to daemon at ${host}:${port}` : `${mainSession.model}`;
 
   console.log(`
 ${ANSI.bold}${ANSI.cyan}
@@ -1911,69 +2158,23 @@ ${ANSI.bold}${ANSI.cyan}
  ██║ ╚████║██║  ██║██║ ╚████║╚██████╔╝╚██████╗╚██████╔╝██████╔╝███████╗
  ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
 ${ANSI.reset}
-${ANSI.dim}nanocode${ANSI.reset} | ${ANSI.dim}${mainSession.model}${ANSI.reset} | ${ANSI.dim}${process.cwd()}${ANSI.reset}
-${gatewayServer ? `${ANSI.dim}gateway: ${getGatewayHost()}:${getGatewayPort()}${ANSI.reset}` : ""}
+${ANSI.dim}nanocode${ANSI.reset} | ${ANSI.dim}${modeLabel}${ANSI.reset} | ${ANSI.dim}${process.cwd()}${ANSI.reset}
+${gatewayServer ? `${ANSI.dim}gateway: ${host}:${port}${ANSI.reset}` : ""}
 ${slackBotUserId ? `${ANSI.dim}slack: connected${ANSI.reset}` : ""}
 ${discordBotUserId ? `${ANSI.dim}discord: connected${ANSI.reset}` : ""}
 ${canvasServer ? `${ANSI.dim}canvas: 127.0.0.1:${CONFIG.canvas.port}${ANSI.reset}` : ""}
 `);
 
-  const separator = () => console.log(`${ANSI.dim}${"─".repeat(80)}${ANSI.reset}`);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  // Connect REPL to gateway as WebSocket client
+  await runReplOverWebSocket(gatewayUrl, mainSession);
 
-  while (true) {
-    separator();
-    const input = await new Promise<string>((resolve) => {
-      rl.question(`${ANSI.bold}${ANSI.blue}❯${ANSI.reset} `, (answer: string) => resolve(answer.trim()));
-    });
-    separator();
-
-    // Voice mode: empty input triggers recording
-    let userInput = input;
-    if (!userInput && voiceMode) {
-      console.log(`${ANSI.yellow}🎤 Recording... (press Ctrl+C to stop, max 10s)${ANSI.reset}`);
-      const audio = await recordAudio();
-      if (audio) {
-        console.log(`${ANSI.dim}Transcribing...${ANSI.reset}`);
-        try { userInput = await speechToText(audio); console.log(`${ANSI.cyan}⏺ You said:${ANSI.reset} ${userInput}`); }
-        catch (e) { console.log(`${ANSI.red}STT error: ${e}${ANSI.reset}`); continue; }
-      } else { continue; }
-    }
-    if (!userInput) continue;
-
-    // Command dispatch
-    const spaceIdx = userInput.indexOf(" ");
-    const cmdName = spaceIdx > 0 ? userInput.slice(0, spaceIdx) : userInput;
-    const cmdArgs = spaceIdx > 0 ? userInput.slice(spaceIdx + 1) : "";
-
-    const handler = COMMANDS.get(cmdName) ?? extCommands.get(cmdName);
-    if (handler) {
-      const shouldExit = await handler(cmdArgs, mainSession, stdoutSink);
-      if (shouldExit === true) break;
-      continue;
-    }
-
-    mainSession.messages.push({ role: "user", content: userInput });
-    const currentPrompt = await loadSystemPrompt(mainSession);
-    await runAgentLoop(mainSession.messages, currentPrompt, { session: mainSession, sink: stdoutSink });
-
-    // Voice TTS: speak the response
-    if (voiceMode) {
-      const lastAssistant = [...mainSession.messages].reverse().find((m: any) => m.role === "assistant");
-      if (lastAssistant) {
-        const txt = Array.isArray(lastAssistant.content) ? lastAssistant.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") : String(lastAssistant.content);
-        if (txt) await textToSpeech(txt);
-      }
-    }
-    console.log();
+  // Cleanup (embedded mode only — thin client has nothing to clean up)
+  if (!externalDaemon) {
+    await fireHook("session_shutdown", { session: mainSession });
+    for (const [_, s] of sessions) { if (s.containerId) destroySandbox(s.containerId); }
+    if (slackSocket) slackSocket.close();
+    if (discordWs) discordWs.close();
   }
-
-  // Cleanup
-  await fireHook("session_shutdown", { session: mainSession });
-  for (const [_, s] of sessions) { if (s.containerId) destroySandbox(s.containerId); }
-  if (slackSocket) slackSocket.close();
-  if (discordWs) discordWs.close();
-  rl.close();
 }
 
 main().catch((e) => { console.error(`${ANSI.red}Fatal: ${e}${ANSI.reset}`); process.exit(1); });
