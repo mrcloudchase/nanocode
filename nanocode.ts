@@ -189,7 +189,7 @@ interface GatewayMessage {
 // Gateway JSON Schema validation
 const GATEWAY_SCHEMA: Record<string, { required: string[]; optional: string[] }> = {
   heartbeat: { required: ["type"], optional: ["idempotencyKey"] },
-  message: { required: ["type", "text"], optional: ["idempotencyKey", "sessionId", "source", "media"] },
+  message: { required: ["type", "source", "text"], optional: ["idempotencyKey", "sessionId", "media"] },
   subscribe: { required: ["type"], optional: ["idempotencyKey", "sessionId"] },
   auth: { required: ["type"], optional: ["password", "challenge", "signature"] },
 };
@@ -1108,16 +1108,17 @@ async function handleGatewayMessage(ws: any, msg: GatewayMessage) {
     return;
   }
 
-  if (msg.type === "message" && msg.text) {
+  if (msg.type === "message" && msg.source && msg.text) {
     let sessionId: string;
     let session: SessionState;
 
     if (msg.sessionId === "main") {
-      // REPL/local client targeting the main session directly
+      // REPL/control interface targeting the main session directly
       sessionId = "main";
       session = getOrCreateSession("main", "main");
       session.messages.push({ role: "user", content: msg.text });
-    } else if (msg.source) {
+    } else {
+      // Platform adapter routing (Slack, Discord, etc.)
       const sessionType: SessionType = msg.source.channel.startsWith("D") ? "dm" : "group";
       sessionId = `${sessionType}:${msg.source.platform}:${msg.source.channel}:${msg.source.user}`;
       session = getOrCreateSession(sessionId, sessionType);
@@ -1130,9 +1131,6 @@ async function handleGatewayMessage(ws: any, msg: GatewayMessage) {
       // Wrap with source metadata for prompt injection defense
       const wrappedContent = `<source platform="${msg.source.platform}" user="${msg.source.user}" channel="${msg.source.channel}">\n${msg.text}\n</source>`;
       session.messages.push({ role: "user", content: wrappedContent });
-    } else {
-      ws.send(JSON.stringify({ type: "error", error: "message requires source or sessionId='main'" }));
-      return;
     }
 
     const sink = wsSink(ws, sessionId);
@@ -2036,7 +2034,7 @@ async function runReplOverWebSocket(gatewayUrl: string, mainSession: SessionStat
         }
 
         // Send chat message through the gateway
-        ws.send(JSON.stringify({ type: "message", sessionId: "main", text: userInput }));
+        ws.send(JSON.stringify({ type: "message", sessionId: "main", source: { platform: "cli", channel: "main", user: "operator" }, text: userInput }));
 
         // Wait for message_end before showing next prompt
         await new Promise<void>((res) => { responseResolve = res; });
